@@ -151,6 +151,7 @@ export type {
   VideoBlockObjectResponse,
 } from "./api-endpoints"
 export { default as Client } from "./Client"
+export type { ClientOptions, RetryOptions } from "./Client"
 export { LogLevel, Logger } from "./logging"
 export {
   // Error codes

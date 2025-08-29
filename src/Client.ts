@@ -113,6 +113,25 @@ import {
 } from "../package.json"
 import type { SupportedFetch } from "./fetch-types"
 
+export interface RetryOptions {
+  /** Maximum number of retry attempts. Default: 3 */
+  maxRetries?: number
+  /** Initial delay between retries in milliseconds. Default: 1000 */
+  initialDelayMs?: number
+  /** Maximum delay between retries in milliseconds. Default: 30000 */
+  maxDelayMs?: number
+  /** Multiplier for exponential backoff. Default: 2 */
+  backoffMultiplier?: number
+  /** Whether to retry on rate limit errors. Default: true */
+  retryOnRateLimit?: boolean
+  /** Whether to retry on server errors (5xx). Default: true */
+  retryOnServerError?: boolean
+  /** Whether to respect Retry-After headers from the server. Default: true */
+  respectRetryAfter?: boolean
+  /** Whether to retry non-idempotent methods (POST, PATCH, DELETE). Default: false */
+  retryNonIdempotentMethods?: boolean
+}
+
 export interface ClientOptions {
   auth?: string
   timeoutMs?: number
@@ -123,6 +142,8 @@ export interface ClientOptions {
   fetch?: SupportedFetch
   /** Silently ignored in the browser */
   agent?: Agent
+  /** Retry configuration for failed requests */
+  retry?: RetryOptions
 }
 
 type FileParam = {
@@ -160,6 +181,7 @@ export default class Client {
   #fetch: SupportedFetch
   #agent: Agent | undefined
   #userAgent: string
+  #retryOptions: Required<RetryOptions>
 
   static readonly defaultNotionVersion = "2025-09-03"
 
@@ -173,12 +195,180 @@ export default class Client {
     this.#fetch = options?.fetch ?? fetch
     this.#agent = options?.agent
     this.#userAgent = `notionhq-client/${PACKAGE_VERSION}`
+    this.#retryOptions = {
+      maxRetries: options?.retry?.maxRetries ?? 3,
+      initialDelayMs: options?.retry?.initialDelayMs ?? 1000,
+      maxDelayMs: options?.retry?.maxDelayMs ?? 30_000,
+      backoffMultiplier: options?.retry?.backoffMultiplier ?? 2,
+      retryOnRateLimit: options?.retry?.retryOnRateLimit ?? true,
+      retryOnServerError: options?.retry?.retryOnServerError ?? true,
+      respectRetryAfter: options?.retry?.respectRetryAfter ?? true,
+      retryNonIdempotentMethods: options?.retry?.retryNonIdempotentMethods ?? false,
+    }
   }
 
   /**
-   * Sends a request.
+   * Determines if a request method is idempotent and safe to retry.
+   * Conservative approach: only GET, HEAD, PUT, OPTIONS, and TRACE are considered safe.
+   * DELETE is technically idempotent but excluded for safety.
+   * POST and PATCH are not idempotent and require explicit opt-in.
+   */
+  private isIdempotentMethod(method: string): boolean {
+    const safeIdempotentMethods = ['GET', 'HEAD', 'PUT', 'OPTIONS', 'TRACE']
+    return safeIdempotentMethods.includes(method.toUpperCase())
+  }
+
+  /**
+   * Extracts Retry-After header value and converts to milliseconds.
+   */
+  private parseRetryAfterHeader(headers: Headers | Record<string, string>): number | null {
+    let retryAfter: string | null = null
+    
+    if (headers instanceof Headers) {
+      retryAfter = headers.get('retry-after') || headers.get('Retry-After')
+    } else if (typeof headers === 'object' && headers !== null) {
+      retryAfter = (headers['retry-after'] || headers['Retry-After']) ?? null
+    }
+    
+    if (!retryAfter) {
+      return null
+    }
+
+    // Retry-After can be in seconds (number) or HTTP date
+    const seconds = parseInt(retryAfter, 10)
+    if (!isNaN(seconds)) {
+      return seconds * 1000 // Convert to milliseconds
+    }
+
+    // Try parsing as HTTP date
+    const date = new Date(retryAfter)
+    if (!isNaN(date.getTime())) {
+      return Math.max(0, date.getTime() - Date.now())
+    }
+
+    return null
+  }
+
+  /**
+   * Determines if an error should be retried based on retry configuration.
+   */
+  private shouldRetry(error: unknown, attempt: number, method: string): boolean {
+    if (attempt >= this.#retryOptions.maxRetries) {
+      return false
+    }
+
+    // Check idempotency - only retry non-idempotent methods if explicitly configured
+    if (!this.isIdempotentMethod(method) && !this.#retryOptions.retryNonIdempotentMethods) {
+      return false
+    }
+
+    if (isNotionClientError(error)) {
+      // Retry on rate limit errors if configured
+      if (error.code === "rate_limited" && this.#retryOptions.retryOnRateLimit) {
+        return true
+      }
+
+      // Retry on server errors (5xx) if configured
+      if (
+        this.#retryOptions.retryOnServerError &&
+        isHTTPResponseError(error) &&
+        error.status >= 500 &&
+        error.status < 600
+      ) {
+        return true
+      }
+
+      // Retry on service unavailable (only if server error retries are enabled)
+      if (error.code === "service_unavailable" && this.#retryOptions.retryOnServerError) {
+        return true
+      }
+
+      // Retry on internal server error (only if server error retries are enabled)
+      if (error.code === "internal_server_error" && this.#retryOptions.retryOnServerError) {
+        return true
+      }
+    }
+
+    // Retry on network errors (non-Notion client errors)
+    if (!isNotionClientError(error)) {
+      return true
+    }
+
+    return false
+  }
+
+  /**
+   * Calculates the delay for the next retry attempt using exponential backoff.
+   * Respects Retry-After header if present and configured to do so.
+   */
+  private calculateRetryDelay(attempt: number, error?: unknown): number {
+    // Check for Retry-After header if configured and error is HTTP response error
+    if (
+      this.#retryOptions.respectRetryAfter &&
+      error &&
+      isHTTPResponseError(error) &&
+      error.headers
+    ) {
+      const retryAfterMs = this.parseRetryAfterHeader(error.headers as Headers)
+      if (retryAfterMs !== null) {
+        // Respect the server's suggested delay, but cap it at maxDelayMs
+        return Math.min(retryAfterMs, this.#retryOptions.maxDelayMs)
+      }
+    }
+
+    // Fall back to exponential backoff
+    const delay = this.#retryOptions.initialDelayMs * Math.pow(this.#retryOptions.backoffMultiplier, attempt)
+    return Math.min(delay, this.#retryOptions.maxDelayMs)
+  }
+
+  /**
+   * Sleeps for the specified number of milliseconds.
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  /**
+   * Sends a request with automatic retry logic.
    */
   public async request<ResponseBody>(
+    args: RequestParameters
+  ): Promise<ResponseBody> {
+    let lastError: unknown
+    
+    for (let attempt = 0; attempt <= this.#retryOptions.maxRetries; attempt++) {
+      try {
+        return await this.#makeRequest<ResponseBody>(args)
+      } catch (error) {
+        lastError = error
+        
+        if (!this.shouldRetry(error, attempt, args.method)) {
+          throw error
+        }
+
+        const delay = this.calculateRetryDelay(attempt, error)
+        
+        this.log(LogLevel.INFO, "request retry", {
+          attempt: attempt + 1,
+          maxRetries: this.#retryOptions.maxRetries,
+          delayMs: delay,
+          error: isNotionClientError(error) ? error.code : "network_error",
+          method: args.method,
+          path: args.path,
+        })
+
+        await this.sleep(delay)
+      }
+    }
+
+    // This should never be reached, but TypeScript requires it
+    throw lastError
+  }
+
+  /**
+   * Makes a single request without retry logic.
+   */
+  async #makeRequest<ResponseBody>(
     args: RequestParameters
   ): Promise<ResponseBody> {
     const { path, method, query, body, formDataParams, auth } = args
